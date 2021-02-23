@@ -1,5 +1,5 @@
 import BluebirdPromise from "bluebird-lst"
-import { deepAssign, Arch, AsyncTaskManager, exec, InvalidConfigurationError, log, use } from "builder-util"
+import { deepAssign, Arch, AsyncTaskManager, exec, InvalidConfigurationError, log, use, getArchSuffix } from "builder-util"
 import { signAsync, SignOptions } from "../electron-osx-sign"
 import { mkdirs, readdir } from "fs-extra"
 import { Lazy } from "lazy-val"
@@ -18,6 +18,7 @@ import { PkgTarget, prepareProductBuildArgs } from "./targets/pkg"
 import { createCommonTarget, NoOpTarget } from "./targets/targetFactory"
 import { isMacOsHighSierra } from "./util/macosVersion"
 import { getTemplatePath } from "./util/pathManager"
+import { promisify } from "util"
 
 export default class MacPackager extends PlatformPackager<MacConfiguration> {
   readonly codeSigningInfo = new Lazy<CodeSigningInfo>(() => {
@@ -91,6 +92,42 @@ export default class MacPackager extends PlatformPackager<MacConfiguration> {
     }
   }
 
+  protected async doPack(outDir: string, appOutDir: string, platformName: ElectronPlatformName, arch: Arch, platformSpecificBuildOptions: MacConfiguration, targets: Array<Target>): Promise<any> {
+    switch (arch) {
+      default: {
+        return super.doPack(outDir, appOutDir, platformName, arch, platformSpecificBuildOptions, targets);
+      }
+      case Arch.universal: {
+        const x64Arch = Arch.x64;
+        const x64AppOutDir = appOutDir + '--' + Arch[x64Arch];
+        await super.doPack(outDir, x64AppOutDir, platformName, x64Arch, platformSpecificBuildOptions, targets, false, true);
+        const arm64Arch = Arch.arm64;
+        const arm64AppOutPath = appOutDir + '--' + Arch[arm64Arch];
+        await super.doPack(outDir, arm64AppOutPath, platformName, arm64Arch, platformSpecificBuildOptions, targets, false, true);
+        const framework = this.info.framework
+        log.info({
+          platform: platformName,
+          arch: Arch[arch],
+          [`${framework.name}`]: framework.version,
+          appOutDir: log.filePath(appOutDir),
+        }, `packaging`)
+        const appFile = `${this.appInfo.productFilename}.app`;
+        const { makeUniversalApp } = require('@electron/universal');
+        await makeUniversalApp({
+          x64AppPath: path.join(x64AppOutDir, appFile),
+          arm64AppPath: path.join(arm64AppOutPath, appFile),
+          outAppPath: path.join(appOutDir, appFile),
+          force: true
+        });
+        const rmdir = promisify(require('fs').rmdir);
+        await rmdir(x64AppOutDir, { recursive: true });
+        await rmdir(arm64AppOutPath, { recursive: true });
+        await this.doSignAfterPack(outDir, appOutDir, platformName, arch, platformSpecificBuildOptions, targets);
+        break;
+      }
+    }
+  }
+
   async pack(outDir: string, arch: Arch, targets: Array<Target>, taskManager: AsyncTaskManager): Promise<any> {
     let nonMasPromise: Promise<any> | null = null
 
@@ -100,7 +137,7 @@ export default class MacPackager extends PlatformPackager<MacConfiguration> {
     if (!hasMas || targets.length > 1) {
       const appPath = prepackaged == null ? path.join(this.computeAppOutDir(outDir, arch), `${this.appInfo.productFilename}.app`) : prepackaged
       nonMasPromise = (prepackaged ? Promise.resolve() : this.doPack(outDir, path.dirname(appPath), this.platform.nodeName as ElectronPlatformName, arch, this.platformSpecificBuildOptions, targets))
-        .then(() => this.packageInDistributableFormat(appPath, Arch.x64, targets, taskManager))
+        .then(() => this.packageInDistributableFormat(appPath, arch, targets, taskManager))
     }
 
     for (const target of targets) {
@@ -116,13 +153,13 @@ export default class MacPackager extends PlatformPackager<MacConfiguration> {
         })
       }
 
-      const targetOutDir = path.join(outDir, targetName)
+      const targetOutDir = path.join(outDir, `${targetName}${getArchSuffix(arch)}`)
       if (prepackaged == null) {
         await this.doPack(outDir, targetOutDir, "mas", arch, masBuildOptions, [target])
-        await this.sign(path.join(targetOutDir, `${this.appInfo.productFilename}.app`), targetOutDir, masBuildOptions)
+        await this.sign(path.join(targetOutDir, `${this.appInfo.productFilename}.app`), targetOutDir, masBuildOptions, arch)
       }
       else {
-        await this.sign(prepackaged, targetOutDir, masBuildOptions)
+        await this.sign(prepackaged, targetOutDir, masBuildOptions, arch)
       }
     }
 
@@ -131,7 +168,7 @@ export default class MacPackager extends PlatformPackager<MacConfiguration> {
     }
   }
 
-  private async sign(appPath: string, outDir: string | null, masOptions: MasConfiguration | null): Promise<void> {
+  private async sign(appPath: string, outDir: string | null, masOptions: MasConfiguration | null, arch: Arch | null): Promise<void> {
     if (!isSignAllowed()) {
       return
     }
@@ -197,7 +234,12 @@ export default class MacPackager extends PlatformPackager<MacConfiguration> {
           }
         }
         return file.endsWith(".kext") || file.startsWith("/Contents/PlugIns", appPath.length) ||
-          file.includes("/node_modules/puppeteer/.local-chromium") /* https://github.com/electron-userland/electron-builder/issues/2010 */
+          file.includes("/node_modules/puppeteer/.local-chromium") ||  file.includes("/node_modules/playwright-firefox/.local-browsers") || file.includes("/node_modules/playwright/.local-browsers") 
+          
+          /* Those are browser automating modules, browser (chromium, nightly) cannot be signed
+          https://github.com/electron-userland/electron-builder/issues/2010 
+          https://github.com/electron-userland/electron-builder/issues/5383
+          */
       },
       identity: identity!,
       type,
@@ -233,10 +275,10 @@ export default class MacPackager extends PlatformPackager<MacConfiguration> {
       }
 
       // mas uploaded to AppStore, so, use "-" instead of space for name
-      const artifactName = this.expandArtifactNamePattern(masOptions, "pkg")
+      const artifactName = this.expandArtifactNamePattern(masOptions, "pkg", arch)
       const artifactPath = path.join(outDir!, artifactName)
       await this.doFlat(appPath, artifactPath, masInstallerIdentity, keychainFile)
-      await this.dispatchArtifactCreated(artifactPath, null, Arch.x64, this.computeSafeArtifactName(artifactName, "pkg"))
+      await this.dispatchArtifactCreated(artifactPath, null, Arch.x64, this.computeSafeArtifactName(artifactName, "pkg", arch, true, this.platformSpecificBuildOptions.defaultArch))
     }
   }
 
@@ -349,7 +391,7 @@ export default class MacPackager extends PlatformPackager<MacConfiguration> {
 
     await BluebirdPromise.map(readdir(packContext.appOutDir), (file: string): any => {
       if (file === appFileName) {
-        return this.sign(path.join(packContext.appOutDir, file), null, null)
+        return this.sign(path.join(packContext.appOutDir, file), null, null, null)
       }
       return null
     })
@@ -361,7 +403,7 @@ export default class MacPackager extends PlatformPackager<MacConfiguration> {
     const outResourcesDir = path.join(packContext.appOutDir, "resources", "app.asar.unpacked")
     await BluebirdPromise.map(orIfFileNotExist(readdir(outResourcesDir), []), (file: string): any => {
       if (file.endsWith(".app")) {
-        return this.sign(path.join(outResourcesDir, file), null, null)
+        return this.sign(path.join(outResourcesDir, file), null, null, null)
       }
       else {
         return null

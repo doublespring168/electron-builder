@@ -5,7 +5,7 @@ import chalk from "chalk"
 import { ChildProcess, execFile, ExecFileOptions, spawn as _spawn, SpawnOptions } from "child_process"
 import { createHash } from "crypto"
 import _debug from "debug"
-import { safeDump } from "js-yaml"
+import { dump } from "js-yaml"
 import * as path from "path"
 import sourceMapSupport from "source-map-support"
 import { debug, log } from "./log"
@@ -17,11 +17,11 @@ if (process.env.JEST_WORKER_ID == null) {
 export { safeStringifyJson } from "builder-util-runtime"
 export { TmpDir } from "temp-file"
 export { log, debug } from "./log"
-export { Arch, getArchCliNames, toLinuxArchString, getArchSuffix, ArchType, archFromString } from "./arch"
+export { Arch, getArchCliNames, toLinuxArchString, getArchSuffix, ArchType, archFromString, defaultArchFromString } from "./arch"
 export { AsyncTaskManager } from "./asyncTaskManager"
 export { DebugLogger } from "./DebugLogger"
 
-export { copyFile } from "./fs"
+export { copyFile, exists } from "./fs"
 export { asArray } from "builder-util-runtime"
 
 export { deepAssign } from "./deepAssign"
@@ -29,7 +29,7 @@ export { deepAssign } from "./deepAssign"
 export const debug7z = _debug("electron-builder:7z")
 
 export function serializeToYaml(object: any, skipInvalid = false, noRefs = false) {
-  return safeDump(object, {
+  return dump(object, {
     lineWidth: 8000,
     skipInvalid,
     noRefs,
@@ -183,7 +183,7 @@ export function spawnAndWrite(command: string, args: Array<string>, data: string
         clearTimeout(timeout)
       }
       finally {
-        resolve()
+        resolve(undefined)
       }
     }, error => {
       try {
@@ -381,7 +381,7 @@ export function executeAppBuilder(args: Array<string>, childProcessConsumer?: (c
   }
 }
 
-async function retry<T>(task: () => Promise<T>, retriesLeft: number, interval: number): Promise<T> {
+export async function retry<T>(task: () => Promise<T>, retriesLeft: number, interval: number): Promise<T> {
   try {
     return await task()
   }

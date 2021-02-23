@@ -1,6 +1,6 @@
 import BluebirdPromise from "bluebird-lst"
 import { Arch, asArray, AsyncTaskManager, debug, DebugLogger, deepAssign, getArchSuffix, InvalidConfigurationError, isEmptyOrSpaces, log, isEnvTrue } from "builder-util"
-import { getArtifactArchName } from "builder-util/out/arch"
+import { defaultArchFromString, getArtifactArchName } from "builder-util/out/arch"
 import { FileTransformer, statOrNull } from "builder-util/out/fs"
 import { orIfFileNotExist } from "builder-util/out/promise"
 import { readdir } from "fs-extra"
@@ -100,7 +100,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
   }
 
   protected computeAppOutDir(outDir: string, arch: Arch): string {
-    return this.packagerOptions.prepackaged || path.join(outDir, `${this.platform.buildConfigurationKey}${getArchSuffix(arch)}${this.platform === Platform.MAC ? "" : "-unpacked"}`)
+    return this.packagerOptions.prepackaged || path.join(outDir, `${this.platform.buildConfigurationKey}${getArchSuffix(arch, this.platformSpecificBuildOptions.defaultArch)}${this.platform === Platform.MAC ? "" : "-unpacked"}`)
   }
 
   dispatchArtifactCreated(file: string, target: Target | null, arch: Arch | null, safeArtifactName?: string | null): Promise<void> {
@@ -158,8 +158,18 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     }
   }
 
-  protected async doPack(outDir: string, appOutDir: string, platformName: ElectronPlatformName, arch: Arch, platformSpecificBuildOptions: DC, targets: Array<Target>) {
+  protected async doPack(outDir: string, appOutDir: string, platformName: ElectronPlatformName, arch: Arch, platformSpecificBuildOptions: DC, targets: Array<Target>, sign: boolean = true, disableAsarIntegrity: boolean = false) {
     if (this.packagerOptions.prepackaged != null) {
+      return
+    }
+
+    if (this.info.cancellationToken.cancelled) {
+      return
+    }
+
+    await this.info.installAppDependencies(this.platform, arch);
+
+    if (this.info.cancellationToken.cancelled) {
       return
     }
 
@@ -216,7 +226,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
       await framework.beforeCopyExtraFiles({
         packager: this,
         appOutDir,
-        asarIntegrity: asarOptions == null ? null : await computeData(resourcesPath, asarOptions.externalAllowed ? {externalAllowed: true} : null),
+        asarIntegrity: asarOptions == null || disableAsarIntegrity ? null : await computeData(resourcesPath, asarOptions.externalAllowed ? {externalAllowed: true} : null),
         platformName,
       })
     }
@@ -241,11 +251,26 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
 
     const isAsar = asarOptions != null
     await this.sanityCheckPackage(appOutDir, isAsar, framework)
-    await this.signApp(packContext, isAsar)
+    if (sign) {
+      await this.doSignAfterPack(outDir, appOutDir, platformName, arch, platformSpecificBuildOptions, targets);
+    }
+  }
 
-    const afterSign = resolveFunction(this.config.afterSign, "afterSign")
+  protected async doSignAfterPack(outDir: string, appOutDir: string, platformName: ElectronPlatformName, arch: Arch, platformSpecificBuildOptions: DC, targets: Array<Target>) {
+    const asarOptions = await this.computeAsarOptions(platformSpecificBuildOptions);
+    const isAsar = asarOptions != null;
+    const packContext = {
+      appOutDir,
+      outDir,
+      arch,
+      targets,
+      packager: this,
+      electronPlatformName: platformName
+    };
+    await this.signApp(packContext, isAsar);
+    const afterSign = resolveFunction(this.config.afterSign, "afterSign");
     if (afterSign != null) {
-      await Promise.resolve(afterSign(packContext))
+      await Promise.resolve(afterSign(packContext));
     }
   }
 
@@ -458,11 +483,11 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
   }
 
   // tslint:disable-next-line:no-invalid-template-strings
-  computeSafeArtifactName(suggestedName: string | null, ext: string, arch?: Arch | null, skipArchIfX64 = true, safePattern: string = "${name}-${version}-${arch}.${ext}"): string | null {
-    return computeSafeArtifactNameIfNeeded(suggestedName, () => this.computeArtifactName(safePattern, ext, skipArchIfX64 && arch === Arch.x64 ? null : arch))
+  computeSafeArtifactName(suggestedName: string | null, ext: string, arch?: Arch | null, skipDefaultArch: boolean = true, defaultArch?: string, safePattern: string = "${name}-${version}-${arch}.${ext}"): string | null {
+    return computeSafeArtifactNameIfNeeded(suggestedName, () => this.computeArtifactName(safePattern, ext, skipDefaultArch && arch === defaultArchFromString(defaultArch) ? null : arch))
   }
 
-  expandArtifactNamePattern(targetSpecificOptions: TargetSpecificOptions | null | undefined, ext: string, arch?: Arch | null, defaultPattern?: string, skipArchIfX64 = true): string {
+  expandArtifactNamePattern(targetSpecificOptions: TargetSpecificOptions | null | undefined, ext: string, arch?: Arch | null, defaultPattern?: string, skipDefaultArch: boolean = true, defaultArch?: string): string {
     let pattern = targetSpecificOptions == null ? null : targetSpecificOptions.artifactName
     if (pattern == null) {
       pattern = this.platformSpecificBuildOptions.artifactName || this.config.artifactName
@@ -471,13 +496,12 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
     if (pattern == null) {
       // tslint:disable-next-line:no-invalid-template-strings
       pattern = defaultPattern || "${productName}-${version}-${arch}.${ext}"
-    }
-    else {
+    } else {
       // https://github.com/electron-userland/electron-builder/issues/3510
       // always respect arch in user custom artifact pattern
-      skipArchIfX64 = false
+      skipDefaultArch = this.platform === Platform.MAC
     }
-    return this.computeArtifactName(pattern, ext, skipArchIfX64 && arch === Arch.x64 ? null : arch)
+    return this.computeArtifactName(pattern, ext, skipDefaultArch && arch === defaultArchFromString(defaultArch) ? null : arch)
   }
 
   expandArtifactBeautyNamePattern(targetSpecificOptions: TargetSpecificOptions | null | undefined, ext: string, arch?: Arch | null): string {
@@ -487,7 +511,7 @@ export abstract class PlatformPackager<DC extends PlatformSpecificBuildOptions> 
 
   private computeArtifactName(pattern: any, ext: string, arch: Arch | null | undefined): string {
     const archName = arch == null ? null : getArtifactArchName(arch, ext)
-    return this.expandMacro(pattern, this.platform === Platform.MAC ? null : archName, {
+    return this.expandMacro(pattern, archName, {
       ext
     })
   }

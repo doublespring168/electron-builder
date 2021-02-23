@@ -1,4 +1,4 @@
-import { addValue, Arch, archFromString, AsyncTaskManager, DebugLogger, deepAssign, exec, InvalidConfigurationError, log, safeStringifyJson, serializeToYaml, TmpDir } from "builder-util"
+import { addValue, Arch, archFromString, AsyncTaskManager, DebugLogger, deepAssign, InvalidConfigurationError, log, safeStringifyJson, serializeToYaml, TmpDir } from "builder-util"
 import { CancellationToken } from "builder-util-runtime"
 import { executeFinally, orNullIfFileNotExist } from "builder-util/out/promise"
 import { EventEmitter } from "events"
@@ -23,7 +23,7 @@ import { expandMacro } from "./util/macroExpander"
 import { createLazyProductionDeps, NodeModuleDirInfo } from "./util/packageDependencies"
 import { checkMetadata, readPackageJson } from "./util/packageMetadata"
 import { getRepositoryInfo } from "./util/repositoryInfo"
-import { getGypEnv, installOrRebuild } from "./util/yarn"
+import { installOrRebuild, nodeGypRebuild } from "./util/yarn"
 import { WinPackager } from "./winPackager"
 
 function addHandler(emitter: EventEmitter, event: string, handler: (...args: Array<any>) => void) {
@@ -185,10 +185,6 @@ export class Packager {
 
     function processTargets(platform: Platform, types: Array<string>) {
       function commonArch(currentIfNotSpecified: boolean): Array<Arch> {
-        if (platform === Platform.MAC) {
-          return currentIfNotSpecified ? [Arch.x64] : []
-        }
-
         const result = Array<Arch>()
         return result.length === 0 && currentIfNotSpecified ? [archFromString(process.arch)] : result
       }
@@ -431,12 +427,6 @@ export class Packager {
           break
         }
 
-        await this.installAppDependencies(platform, arch)
-
-        if (this.cancellationToken.cancelled) {
-          break
-        }
-
         // support os and arch macro in output value
         const outDir = path.resolve(this.projectDir, packager.expandMacro(this._configuration!!.directories!!.output!!, Arch[arch]))
         const targetList = createTargets(nameToTarget, targetNames.length === 0 ? packager.defaultTarget : targetNames, outDir, packager)
@@ -481,7 +471,7 @@ export class Packager {
     }
   }
 
-  private async installAppDependencies(platform: Platform, arch: Arch): Promise<any> {
+  public async installAppDependencies(platform: Platform, arch: Arch): Promise<any> {
     if (this.options.prepackaged != null || this.framework.isNpmRebuildRequired !== true) {
       return
     }
@@ -489,10 +479,7 @@ export class Packager {
     const frameworkInfo = {version: this.framework.version, useCustomDist: true}
     const config = this.config
     if (config.nodeGypRebuild === true) {
-      log.info({arch: Arch[arch]}, "executing node-gyp rebuild")
-      await exec(process.platform === "win32" ? "node-gyp.cmd" : "node-gyp", ["rebuild"], {
-        env: getGypEnv(frameworkInfo, platform.nodeName, Arch[arch], true),
-      })
+      await nodeGypRebuild(platform.nodeName, Arch[arch], frameworkInfo)
     }
 
     if (config.npmRebuild === false) {
